@@ -15,8 +15,6 @@
 #include <linux/platform_device.h>
 #include <linux/gpio/driver.h>
 
-#define elemof(T) (sizeof T/sizeof*T)
-
 static const char *pin_names[] = {
 	"d0", "d1", "d2", "d3", "d4", "d5", "d6", "d7", // data:o
 	"err", "slin", "pe", "ack", "busy", // status:i
@@ -183,16 +181,38 @@ static int get_multiple(struct gpio_chip *gc, unsigned long *mask, unsigned long
 	return 0;
 }
 
+static const struct gpio_chip gpio_chip_template = {
+	.label = DRV_NAME,
+	.get_direction = get_direction,
+	.direction_input = direction_input,
+	.direction_output = direction_output,
+	.get = get,
+	.get_multiple = get_multiple,
+	.set = set,
+	.set_multiple = set_multiple,
+	.base = -1,
+	.ngpio = ARRAY_SIZE(pin_names),
+	.names = pin_names
+};
+
 /*
  parport_gpio_init {
   attach {alloc, add to list}
   probe {}
  }
 
+or
+
+ parport_gpio_init {
+  attach {alloc, add to list
+   probe {}
+  }
+ }
+
  parport_gpio_exit {
+  remove {}
   detach {
-   remove {}
-   del from list, free
+   slot_destroy
   }
  }
 */
@@ -203,6 +223,8 @@ module_param_array_named(parport, param_parport, charp, NULL, 0);
 MODULE_PARM_DESC(parport, "Comma-separated list of parport numbers to claim.");
 
 static unsigned long parports_to_claim = 0;
+
+static void slot_destroy(struct parport_gpio *slot);
 
 static void attach(struct parport *port)
 {
@@ -217,57 +239,58 @@ static void attach(struct parport *port)
 
 	pr_devel("%s(%s)\n", __func__, port->name);
 
-	if (!(parports_to_claim & 1<<port->number))
+	if (!(parports_to_claim & 1ul<<port->number)) {
+		pr_devel("%s ignored\n", port->name);
 		return;
+	}
 
 	id = port->number;
 	pardev = parport_register_dev_model(port, DRV_NAME, &par_dev_cb, id);
 	if (!pardev) {
-		pr_err("parport_register_dev_model() failed\n");
+		pr_devel("parport_register_dev_model() failed\n");
 		return;
-	}
-
-	pdev = platform_device_register_simple(DRV_NAME, id, NULL, 0);
-	if (IS_ERR(pdev)) {
-		pr_err("Error registering device\n");
-		goto err_unreg_pardev;
 	}
 
 	slot = slot_alloc(id);
 	if (!slot) {
-		goto err_unreg_pdev;
+		parport_unregister_device(pardev);
+		return;
 	}
-
 	slot->par_device = pardev;
-	slot->gpio_device = pdev;
 	list_add(&slot->list, &slots);
+
+	/* It seems that probe() may be called here, so we should have
+	   the slot in place. */
+
+	pdev = platform_device_register_simple(DRV_NAME, id, NULL, 0);
+	if (IS_ERR(pdev)) {
+		pr_err("Error registering device\n");
+		goto err_destroy;
+	}
+	slot->gpio_device = pdev;
 
 	pr_info("Attached %s.%d to parport%d\n", DRV_NAME, id, port->number);
 	pr_devel("%s end\n", __func__);
 	return;
 
-err_unreg_pdev:
-	platform_device_unregister(pdev);
-err_unreg_pardev:
-	parport_unregister_device(pardev);
-	pr_devel("%s end\n", __func__);
+err_destroy:
+	/* probe() may have removed the slot already, so try to find it first. */
+	slot = slot_by_id(id);
+	if (slot)
+		slot_destroy(slot);
+	pr_devel("%s end (with error)\n", __func__);
 }
 
 static void detach(struct parport *port)
 {
 	struct parport_gpio *slot;
 
-	pr_devel("%s()\n", __func__);
+	pr_devel("%s(%s)\n", __func__, port->name);
 
 	slot = slot_by_port(port);
 	if (slot) {
 		pr_info("Detaching %s.%d from parport%d\n", DRV_NAME, slot->id, port->number);
-		parport_release(slot->par_device);
-		parport_unregister_device(slot->par_device); // calls remove()
-		slot->par_device = 0;
-		platform_device_unregister(slot->gpio_device);
-		list_del_init(&slot->list);
-		slot_free(slot);
+		slot_destroy(slot);
 	}
 
 	pr_devel("%s end\n", __func__);
@@ -278,20 +301,6 @@ static int probe(struct platform_device *pdev)
 	struct parport_gpio *slot;
 	int ret;
 
-	static struct gpio_chip gc = {
-		.label = DRV_NAME,
-		.get_direction = get_direction,
-		.direction_input = direction_input,
-		.direction_output = direction_output,
-		.get = get,
-		.get_multiple = get_multiple,
-		.set = set,
-		.set_multiple = set_multiple,
-		.base = -1,
-		.ngpio = elemof(pin_names),
-		.names = pin_names
-	};
-
 	pr_devel("%s() pdev->id = %d\n", __func__, pdev->id);
 
 	slot = slot_by_id(pdev->id);
@@ -301,22 +310,22 @@ static int probe(struct platform_device *pdev)
 	}
 	platform_set_drvdata(pdev, slot);
 
-	slot->gpio = gc;
+	slot->gpio = gpio_chip_template;
 
 	ret = gpiochip_add_data(&slot->gpio, slot);
-	if (ret < 0)
-		goto err_free;
+	if (ret < 0) {
+		pr_devel("gpiochip_add_data() failed\n");
+		goto err_destroy;
+	}
 
 	parport_claim_or_block(slot->par_device);
-
-	list_add(&slot->list, &slots);
 
 	pr_devel("%s end\n", __func__);
 	return 0;
 
-err_free:
-	slot_free(slot);
-//err:
+err_destroy:
+	slot_destroy(slot);
+	pr_devel("%s end (with error)\n", __func__);
 	return ret;
 }
 
@@ -328,10 +337,21 @@ static int remove(struct platform_device *pdev)
 
 	slot = platform_get_drvdata(pdev);
 	gpiochip_remove(&slot->gpio);
-	slot->gpio_device = 0;
 
 	pr_devel("%s end\n", __func__);
 	return 0;
+}
+
+static void slot_destroy(struct parport_gpio *slot)
+{
+	if (slot->gpio_device)
+		platform_device_unregister(slot->gpio_device);
+	if (slot->par_device) {
+		parport_release(slot->par_device);
+		parport_unregister_device(slot->par_device);
+	}
+	list_del(&slot->list);
+	slot_free(slot);
 }
 
 static struct parport_driver parport_driver = {
@@ -371,7 +391,7 @@ static int __init parport_gpio_init(void)
 			pr_err("Should be a parport number: \"%s\"\n", s);
 			return -ENODEV;
 		}
-		parports_to_claim |= 1 << v;
+		parports_to_claim |= 1ul << v;
 	}
 
 	if (!parports_to_claim)
@@ -398,8 +418,8 @@ static void __exit parport_gpio_exit(void)
 {
 	pr_devel("%s()\n", __func__);
 
-	parport_unregister_driver(&parport_driver);
 	platform_driver_unregister(&gpio_driver);
+	parport_unregister_driver(&parport_driver);
 
 	pr_devel("%s end\n", __func__);
 }
