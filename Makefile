@@ -2,10 +2,7 @@ NAME = parport-gpio
 
 obj-m := $(NAME).o
 
-KVERSION := $(shell uname -r)
+KDIR ?= /lib/modules/$(shell uname -r)/build
 
-all:
-	make -C /lib/modules/$(KVERSION)/build M=$(PWD) modules
-
-clean:
-	make -C /lib/modules/$(KVERSION)/build M=$(PWD) clean
+modules modules_install clean:
+	make -C $(KDIR) M=$(PWD) $@
