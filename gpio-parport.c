@@ -196,34 +196,25 @@ static struct gpio_parport *slot_by_id(int id)
 	return 0;
 }
 
-/*
- gpio_parport_init {
-  attach {alloc, add to list}
-  probe {}
- }
+static char *param_parport = "parport0";
+module_param_named(parport, param_parport, charp, 0664);
+MODULE_PARM_DESC(parports, "Comma-separated list of parport names to claim, or \"any\".");
 
-or
-
- gpio_parport_init {
-  attach {alloc, add to list
-   probe {}
-  }
- }
-
- gpio_parport_exit {
-  remove {}
-  detach {
-   slot_destroy
-  }
- }
-*/
-
-static char *param_parport[8] = {"0"};
-
-module_param_array_named(parport, param_parport, charp, NULL, 0444);
-MODULE_PARM_DESC(parport, "Comma-separated list of parport numbers to claim.");
-
-static unsigned long parports_to_claim = 0;
+static int is_parport_ok(const char *name)
+{
+	int len = strlen(name);
+	char *p = param_parport;
+	if (strcmp(p, "any") == 0)
+		return true;
+	while (*p) {
+		if (strncmp(p, name, len) == 0 && (!p[len] || p[len] == ','))
+			return true;
+		p = strchr(p, ',');
+		if (!p) break;
+		p++;
+	}
+	return false;
+}
 
 static void slot_destroy(struct gpio_parport *slot);
 
@@ -240,7 +231,7 @@ static void attach(struct parport *port)
 
 	pr_debug("%s(%s)\n", __func__, port->name);
 
-	if (!(parports_to_claim & 1ul<<port->number)) {
+	if (!is_parport_ok(port->name)) {
 		pr_debug("%s ignored\n", port->name);
 		return;
 	}
@@ -382,22 +373,8 @@ static struct platform_driver gpio_driver = {
 static int __init gpio_parport_init(void)
 {
 	int ret;
-	int i;
 
 	pr_debug("%s()\n", __func__);
-
-	for (i = 0; param_parport[i]; i++) {
-		char *s = param_parport[i];
-		char *e;
-		unsigned long v = simple_strtoul(s, &e, 0);
-		if (*e || v >= BITS_PER_LONG) {
-			pr_err("Should be a parport number: \"%s\"\n", s);
-			return -ENODEV;
-		}
-		parports_to_claim |= 1ul << v;
-	}
-
-	pr_debug("Waiting for parport %64pbl\n", &parports_to_claim);
 
 	if (parport_register_driver(&parport_driver)) {
 		pr_err("Unable to register with parport driver\n");
@@ -405,14 +382,13 @@ static int __init gpio_parport_init(void)
 	}
 
 	ret = platform_driver_register(&gpio_driver);
-	if (ret)
-		goto err_unreg_parport_driver;
+	if (ret) {
+		parport_unregister_driver(&parport_driver);
+	}
+
+	pr_debug("Waiting for: %s\n", *param_parport ? param_parport : "none");
 
 	pr_debug("%s end\n", __func__);
-	return 0;
-
-err_unreg_parport_driver:
-	parport_unregister_driver(&parport_driver);
 	return ret;
 }
 
