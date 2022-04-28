@@ -1,4 +1,4 @@
-NAME = parport-gpio
+NAME = gpio-parport
 
 obj-m := $(NAME).o
 

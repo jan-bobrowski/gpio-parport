@@ -4,7 +4,7 @@
 */
 
 //#define DEBUG
-#define DRV_NAME "parport-gpio"
+#define DRV_NAME "gpio-parport"
 #define pr_fmt(fmt) DRV_NAME ": " fmt
 
 #include <linux/module.h>
@@ -40,7 +40,7 @@ enum {
 };
 #undef M
 
-struct parport_gpio {
+struct gpio_parport {
 	struct list_head list;
 	int id; // parport number
 	unsigned direction;
@@ -51,7 +51,7 @@ struct parport_gpio {
 
 static void set_bits(struct gpio_chip *gc, unsigned mask, unsigned bits)
 {
-	struct parport_gpio *slot = gpiochip_get_data(gc);
+	struct gpio_parport *slot = gpiochip_get_data(gc);
 	struct parport *port = slot->par_device->port;
 
 	bits ^= Inverted;
@@ -69,7 +69,7 @@ static void set_bits(struct gpio_chip *gc, unsigned mask, unsigned bits)
 
 static unsigned get_bits(struct gpio_chip *gc, unsigned mask)
 {
-	struct parport_gpio *slot = gpiochip_get_data(gc);
+	struct gpio_parport *slot = gpiochip_get_data(gc);
 	struct parport *port = slot->par_device->port;
 	unsigned bits = 0;
 
@@ -85,7 +85,7 @@ static unsigned get_bits(struct gpio_chip *gc, unsigned mask)
 
 static int get_direction(struct gpio_chip *gc, unsigned offset)
 {
-	struct parport_gpio *slot = gpiochip_get_data(gc);
+	struct gpio_parport *slot = gpiochip_get_data(gc);
 	int dir = slot->direction >> offset & 1;
 	pr_debug("%s(%u) %s\n", __func__, offset, dir ? "in" : "out");
 	return dir ? GPIO_LINE_DIRECTION_IN : GPIO_LINE_DIRECTION_OUT;
@@ -93,7 +93,7 @@ static int get_direction(struct gpio_chip *gc, unsigned offset)
 
 static int change_direction(struct gpio_chip *gc, unsigned mask, unsigned dir, unsigned bits)
 {
-	struct parport_gpio *slot = gpiochip_get_data(gc);
+	struct gpio_parport *slot = gpiochip_get_data(gc);
 	unsigned direction = dir | (slot->direction & ~mask);
 	unsigned change = slot->direction ^ direction;
 	if (change & ~ControlMask) {
@@ -126,13 +126,10 @@ static void set(struct gpio_chip *gc, unsigned int offset, int value)
 	set_bits(gc, mask, value ? mask : 0);
 }
 
-static void set_multiple(struct gpio_chip *gc, unsigned long *mask_ptr, unsigned long *bits_ptr)
+static void set_multiple(struct gpio_chip *gc, unsigned long *mask, unsigned long *bits)
 {
-	u8 mask = *mask_ptr & 0xff;
-	u8 bits = *bits_ptr;
-	pr_debug("%s() mask:%02x bits:%02x\n", __func__, mask, bits);
-	if (mask)
-		set_bits(gc, mask, bits);
+	pr_debug("%s(mask:%02lx bits:%02lx)\n", __func__, *mask, *bits);
+	set_bits(gc, *mask, *bits);
 }
 
 static int get(struct gpio_chip *gc, unsigned int offset)
@@ -143,7 +140,7 @@ static int get(struct gpio_chip *gc, unsigned int offset)
 
 static int get_multiple(struct gpio_chip *gc, unsigned long *mask, unsigned long *bits)
 {
-	pr_debug("%s()\n", __func__);
+	pr_debug("%s(%02lx)\n", __func__, *mask);
 	*bits = get_bits(gc, *mask);
 	return 0;
 }
@@ -164,9 +161,9 @@ static const struct gpio_chip gpio_chip_template = {
 
 static LIST_HEAD(slots);
 
-static inline struct parport_gpio *slot_alloc(int id)
+static inline struct gpio_parport *slot_alloc(int id)
 {
-	struct parport_gpio *slot = kzalloc(sizeof *slot, GFP_KERNEL);
+	struct gpio_parport *slot = kzalloc(sizeof *slot, GFP_KERNEL);
 	if (slot) {
 		slot->id = id;
 		slot->direction = Direction;
@@ -174,14 +171,14 @@ static inline struct parport_gpio *slot_alloc(int id)
 	return slot;
 }
 
-static inline void slot_free(struct parport_gpio *slot)
+static inline void slot_free(struct gpio_parport *slot)
 {
 	kfree(slot);
 }
 
-static struct parport_gpio *slot_by_port(struct parport *port)
+static struct gpio_parport *slot_by_port(struct parport *port)
 {
-	struct parport_gpio *slot;
+	struct gpio_parport *slot;
 	list_for_each_entry(slot, &slots, list) {
 		if (slot->par_device->port == port)
 			return slot;
@@ -189,9 +186,9 @@ static struct parport_gpio *slot_by_port(struct parport *port)
 	return 0;
 }
 
-static struct parport_gpio *slot_by_id(int id)
+static struct gpio_parport *slot_by_id(int id)
 {
-	struct parport_gpio *slot;
+	struct gpio_parport *slot;
 	list_for_each_entry(slot, &slots, list) {
 		if (slot->id == id)
 			return slot;
@@ -200,20 +197,20 @@ static struct parport_gpio *slot_by_id(int id)
 }
 
 /*
- parport_gpio_init {
+ gpio_parport_init {
   attach {alloc, add to list}
   probe {}
  }
 
 or
 
- parport_gpio_init {
+ gpio_parport_init {
   attach {alloc, add to list
    probe {}
   }
  }
 
- parport_gpio_exit {
+ gpio_parport_exit {
   remove {}
   detach {
    slot_destroy
@@ -228,11 +225,11 @@ MODULE_PARM_DESC(parport, "Comma-separated list of parport numbers to claim.");
 
 static unsigned long parports_to_claim = 0;
 
-static void slot_destroy(struct parport_gpio *slot);
+static void slot_destroy(struct gpio_parport *slot);
 
 static void attach(struct parport *port)
 {
-	struct parport_gpio *slot;
+	struct gpio_parport *slot;
 	static const struct pardev_cb par_dev_cb = {
 //		.preempt = preempt,
 //		.private = slot
@@ -286,7 +283,7 @@ err_destroy:
 
 static void detach(struct parport *port)
 {
-	struct parport_gpio *slot;
+	struct gpio_parport *slot;
 
 	pr_debug("%s(%s)\n", __func__, port->name);
 
@@ -301,7 +298,7 @@ static void detach(struct parport *port)
 
 static int probe(struct platform_device *pdev)
 {
-	struct parport_gpio *slot;
+	struct gpio_parport *slot;
 	int ret;
 
 	pr_debug("%s() pdev->id = %d\n", __func__, pdev->id);
@@ -335,7 +332,7 @@ err_destroy:
 
 static int remove(struct platform_device *pdev)
 {
-	struct parport_gpio *slot;
+	struct gpio_parport *slot;
 
 	pr_debug("%s()\n", __func__);
 
@@ -346,7 +343,7 @@ static int remove(struct platform_device *pdev)
 	return 0;
 }
 
-static void slot_destroy(struct parport_gpio *slot)
+static void slot_destroy(struct gpio_parport *slot)
 {
 	if (slot->gpio_device)
 		platform_device_unregister(slot->gpio_device);
@@ -365,22 +362,24 @@ static struct parport_driver parport_driver = {
 	.devmodel = true
 };
 
+#ifdef CONFIG_OF
 static const struct of_device_id of_match_table[] = {
 	{ .compatible = DRV_NAME },
 	{},
 };
 MODULE_DEVICE_TABLE(of, of_match_table);
+#endif
 
 static struct platform_driver gpio_driver = {
 	.driver = {
 		.name = DRV_NAME,
-		.of_match_table = of_match_table,
+		.of_match_table = of_match_ptr(of_match_table)
 	},
 	.probe = probe,
 	.remove = remove
 };
 
-static int __init parport_gpio_init(void)
+static int __init gpio_parport_init(void)
 {
 	int ret;
 	int i;
@@ -417,7 +416,7 @@ err_unreg_parport_driver:
 	return ret;
 }
 
-static void __exit parport_gpio_exit(void)
+static void __exit gpio_parport_exit(void)
 {
 	pr_debug("%s()\n", __func__);
 
@@ -427,8 +426,8 @@ static void __exit parport_gpio_exit(void)
 	pr_debug("%s end\n", __func__);
 }
 
-module_init(parport_gpio_init);
-module_exit(parport_gpio_exit);
+module_init(gpio_parport_init);
+module_exit(gpio_parport_exit);
 
 MODULE_AUTHOR("Jan Bobrowski <jb@torinak.com>");
 MODULE_LICENSE("GPL");
