@@ -58,7 +58,7 @@ static void set_bits(struct gpio_chip *gc, unsigned mask, unsigned bits)
 	bits &= mask;
 	if (mask & DataMask) {
 		u8 cmask = ~mask;
-		if (cmask & 0xff)
+		if (cmask)
 			bits = (bits & mask) | (parport_read_data(port) & cmask);
 		parport_write_data(port, bits);
 	}
@@ -74,11 +74,11 @@ static unsigned get_bits(struct gpio_chip *gc, unsigned mask)
 	unsigned bits = 0;
 
 	if (mask & DataMask)
-		bits |= parport_read_data(port);
+		bits |= parport_read_data(port) & DataMask;
 	if (mask & StatusMask)
-		bits |= parport_read_status(port) << StatusShift;
+		bits |= parport_read_status(port) >> 3 << StatusShift & StatusMask;
 	if (mask & ControlMask)
-		bits |= parport_read_control(port) << ControlShift;
+		bits |= parport_read_control(port) << ControlShift & ControlMask;
 	bits ^= Inverted;
 	return bits & mask;
 }
@@ -275,7 +275,7 @@ static int probe(struct platform_device *pdev)
 		struct device_node *node = pdev->dev.of_node;
 		ret = of_property_read_string(node, "parport", &prop_parport);
 		if (ret) {
-			pr_debug("No parport property: %pe\n", ERR_PTR(ret));
+			pr_warn("No parport property: %pe\n", ERR_PTR(ret));
 			return -ENODEV;
 		}
 		pr_debug("parport = \"%s\"", prop_parport);
