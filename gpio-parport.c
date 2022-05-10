@@ -159,20 +159,6 @@ static const struct gpio_chip gpio_chip_template = {
 	.names = pin_names
 };
 
-static inline struct gpio_parport *slot_alloc(void)
-{
-	struct gpio_parport *slot = kzalloc(sizeof *slot, GFP_KERNEL);
-	if (slot) {
-		slot->direction = Direction;
-	}
-	return slot;
-}
-
-static inline void slot_free(struct gpio_parport *slot)
-{
-	kfree(slot);
-}
-
 static LIST_HEAD(slots);
 
 static struct gpio_parport *slot_by_port(struct parport *port)
@@ -188,41 +174,127 @@ static struct gpio_parport *slot_by_port(struct parport *port)
 #ifdef CONFIG_OF
 static char *param_parport = "";
 #else
-static char *param_parport = "parport0";
+static char *param_parport = "0";
 #endif
 module_param_named(parport, param_parport, charp, 0664);
-MODULE_PARM_DESC(parports, "Comma-separated list of parport names to claim, or \"every\".");
+MODULE_PARM_DESC(parports, "Comma-separated list of parport numbers to claim, or \"every\".");
 
-static int is_parport_ok(const char *name)
+
+static int is_parport_ok(int number)
 {
-	int len = strlen(name);
 	char *p = param_parport;
 	if (strcmp(p, "every") == 0)
 		return true;
 	while (*p) {
-		if (strncmp(p, name, len) == 0 && (!p[len] || p[len] == ','))
+		char *e;
+		unsigned long v = simple_strtoul(p, &e, 0);
+		if ((*e && *e != ',') || v > INT_MAX) {
+			pr_err("Should be a parport number: \"%s\"\n", p);
+			e = strchr(e, ',');
+			if (!e)
+				break;
+		} else if (v == number)
 			return true;
-		p = strchr(p, ',');
-		if (!p) break;
-		p++;
+		if (!*e)
+			break;
+		p = e + 1;
 	}
 	return false;
 }
 
-static void disassoc(struct gpio_parport *slot);
+static struct platform_device *create_device(int id)
+{
+	struct platform_device *pdev;
+	int ret;
+
+	pdev = platform_device_alloc(DRV_NAME, id);
+	if (!pdev)
+		return ERR_PTR(-ENOMEM);
+
+	ret = platform_device_add(pdev);
+	if (ret) {
+		platform_device_put(pdev);
+		return ERR_PTR(ret);
+	}
+
+	pr_debug("of: %s\n", of_node_full_name(pdev->dev.of_node));
+
+	return pdev;
+}
+
+static int create_gpio(struct gpio_parport *slot)
+{
+	static const struct pardev_cb par_dev_cb = {
+//		.preempt = preempt,
+//		.private = slot
+	};
+	int ret;
+
+	slot->pp_device = parport_register_dev_model(slot->port, DRV_NAME, &par_dev_cb, slot->port->number);
+	if (!slot->pp_device) {
+		pr_debug("parport_register_dev_model() failed\n");
+		return -ENODEV;
+	}
+
+	slot->chip = gpio_chip_template;
+	slot->chip.parent = &slot->gpio_device->dev;
+	ret = gpiochip_add_data(&slot->chip, slot);
+	if (ret) {
+		pr_debug("gpiochip_add_data() failed\n");
+		goto err;
+	}
+
+	ret = parport_claim(slot->pp_device);
+	if (ret) {
+		pr_warn("Can't claim %s\n", slot->port->name);
+		goto err;
+	}
+
+	pr_info("Attached %s to %s\n", dev_name(&slot->gpio_device->dev), slot->port->name);
+	return 0;
+
+err:
+	parport_unregister_device(slot->pp_device);
+	slot->pp_device = NULL;
+	return ret;
+}
 
 static void attach(struct parport *port)
 {
 	struct gpio_parport *slot;
+	struct platform_device *pdev;
+	int id = port->number;
+	int ret;
 
 	pr_debug("%s(%s)\n", __func__, port->name);
 
-	slot = slot_alloc();
-	if (slot)
-		slot->port = port;
-	list_add(&slot->list, &slots);
+	pdev = create_device(id);
+	if (IS_ERR(pdev)) {
+		pr_err("Can't create dev %s.%d\n", DRV_NAME, id);
+		return;
+	}
 
-	platform_device_register_simple(DRV_NAME, PLATFORM_DEVID_AUTO, NULL, 0);
+	if (!pdev->dev.of_node && !is_parport_ok(id)) {
+unreg:
+		platform_device_unregister(pdev);
+		return;
+	}
+
+	slot = kzalloc(sizeof *slot, GFP_KERNEL);
+	if (!slot)
+		return;
+	slot->direction = Direction;
+	slot->port = port;
+	slot->gpio_device = pdev;
+	platform_set_drvdata(pdev, slot);
+
+	ret = create_gpio(slot);
+	if (ret < 0) {
+		kfree(slot);
+		goto unreg;
+	}
+
+	list_add(&slot->list, &slots);
 
 	pr_debug("%s end\n", __func__);
 }
@@ -237,15 +309,13 @@ static void detach(struct parport *port)
 	if (!slot)
 		return;
 
-	list_del_init(&slot->list);
-	if (slot->gpio_device) {
-		disassoc(slot);
-		parport_unregister_device(slot->pp_device);
-		slot->port = NULL;
-		slot->pp_device = NULL;
-	} else {
-		slot_free(slot);
-	}
+	pr_info("Detaching %s from %s\n", dev_name(&slot->gpio_device->dev), slot->port->name);
+	list_del(&slot->list);
+	gpiochip_remove(&slot->chip);
+	parport_release(slot->pp_device);
+	parport_unregister_device(slot->pp_device);
+	platform_device_unregister(slot->gpio_device);
+	kfree(slot);
 
 	pr_debug("%s end\n", __func__);
 }
@@ -255,119 +325,6 @@ static struct parport_driver parport_driver = {
 	.match_port = attach,
 	.detach = detach,
 	.devmodel = true
-};
-
-static int probe(struct platform_device *pdev)
-{
-	static const struct pardev_cb par_dev_cb = {
-//		.preempt = preempt,
-//		.private = slot
-	};
-	struct gpio_parport *slot;
-	const char *parport_name;
-	const char *prop_parport;
-	int ret;
-
-	pr_debug("%s(%s)\n", __func__, dev_name(&pdev->dev));
-
-	prop_parport = NULL;
-	if (pdev->dev.of_node) {
-		struct device_node *node = pdev->dev.of_node;
-		ret = of_property_read_string(node, "parport", &prop_parport);
-		if (ret) {
-			pr_warn("No parport property: %pe\n", ERR_PTR(ret));
-			return -ENODEV;
-		}
-		pr_debug("parport = \"%s\"", prop_parport);
-	}
-
-	list_for_each_entry(slot, &slots, list) {
-		if (slot->gpio_device)
-			continue;
-		parport_name = slot->port->name;
-		if (prop_parport ? strcmp(prop_parport, parport_name) == 0 : is_parport_ok(parport_name))
-			goto found;
-	}
-	return -ENODEV;
-
-found:
-	pr_debug("Found %s!\n", parport_name);
-
-	slot->pp_device = parport_register_dev_model(slot->port, DRV_NAME, &par_dev_cb, pdev->id);
-	if (!slot->pp_device) {
-		pr_debug("parport_register_dev_model() failed\n");
-		return -ENODEV;
-	}
-
-	platform_set_drvdata(pdev, slot);
-
-	slot->chip = gpio_chip_template;
-	slot->chip.parent = &pdev->dev;
-	ret = gpiochip_add_data(&slot->chip, slot);
-	if (ret) {
-		pr_debug("gpiochip_add_data() failed\n");
-		goto err;
-	}
-
-	ret = parport_claim(slot->pp_device);
-	if (ret) {
-		pr_warn("Can't claim %s\n", parport_name);
-		goto err;
-	}
-
-	slot->gpio_device = pdev;
-	pr_info("Attached %s to %s\n", dev_name(&pdev->dev), parport_name);
-	pr_debug("%s end\n", __func__);
-	return 0;
-
-err:
-	parport_unregister_device(slot->pp_device);
-	slot->pp_device = NULL;
-	return ret;
-}
-
-static int remove(struct platform_device *pdev)
-{
-	struct gpio_parport *slot;
-
-	pr_debug("%s()\n", __func__);
-
-	slot = platform_get_drvdata(pdev);
-	if (!slot->pp_device) {
-		slot_free(slot);
-	} else {
-		disassoc(slot);
-		parport_unregister_device(slot->pp_device);
-		slot->gpio_device = NULL;
-	}
-
-	pr_debug("%s end\n", __func__);
-	return 0;
-}
-
-static void disassoc(struct gpio_parport *slot)
-{
-	struct platform_device *pdev = slot->gpio_device;
-	pr_info("Detaching %s from %s\n", dev_name(&pdev->dev), slot->port->name);
-	gpiochip_remove(&slot->chip);
-	parport_release(slot->pp_device);
-}
-
-#ifdef CONFIG_OF
-static const struct of_device_id of_match_table[] = {
-	{ .compatible = DRV_NAME },
-	{},
-};
-MODULE_DEVICE_TABLE(of, of_match_table);
-#endif
-
-static struct platform_driver gpio_driver = {
-	.driver = {
-		.name = DRV_NAME,
-		.of_match_table = of_match_ptr(of_match_table)
-	},
-	.probe = probe,
-	.remove = remove
 };
 
 static int __init gpio_parport_init(void)
@@ -384,12 +341,6 @@ static int __init gpio_parport_init(void)
 		return ret;
 	}
 
-	ret = platform_driver_register(&gpio_driver);
-	if (ret) {
-		pr_err("Unable to register GPIO driver: %pe\n", ERR_PTR(ret));
-		parport_unregister_driver(&parport_driver);
-	}
-
 	pr_debug("%s end\n", __func__);
 	return ret;
 }
@@ -398,7 +349,6 @@ static void __exit gpio_parport_exit(void)
 {
 	pr_debug("%s()\n", __func__);
 
-	platform_driver_unregister(&gpio_driver);
 	parport_unregister_driver(&parport_driver);
 
 	pr_debug("%s end\n", __func__);
