@@ -179,8 +179,7 @@ static char *param_parport = "0";
 module_param_named(parport, param_parport, charp, 0664);
 MODULE_PARM_DESC(parports, "Comma-separated list of parport numbers to claim, or \"every\".");
 
-
-static int is_parport_ok(int number)
+static bool is_parport_ok(int number)
 {
 	char *p = param_parport;
 	if (strcmp(p, "every") == 0)
